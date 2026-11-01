@@ -686,18 +686,16 @@ if (binaryInfo != null && binaryInfo.length > 0) {
         /^(.*?)\s+?(?:url\s+?jsonjq-)?(request|response)-body(?:-json-jq)?\s+?(.*?)\s*$/
       )
       if ((jqEnabled || isStashiOS) && (isSurgeiOS || isStashiOS || isShadowrocket)) {
-        const jqPath = value.match(/jq-path="(.+?)"/)?.[1]
-        if (jqPath) {
-          if (/^https?:\/\//.test(jqPath)) {
-            value = `'${(await http(jqPath, reqHeaders)).body.replace(/^\s*#.*$/gm, '').replace(/$\r?\n/gm, ' ')}'`
+        const jqPath = getLoonJqPath(value)
+        if (jqPath != null) {
+          // 下载失败或为空时报告，不能输出空的或字面量 jq-path=... 表达式
+          const file = await loadLoonV2JqFile(jqPath)
+          if (file.reason) {
+            otherRule.push(`${_x} [${file.reason}]`)
           } else {
-            value = undefined
-            const e = `暂不支持本地 JQ 文件:\n${x}`
-            console.log(e)
-            shNotify(e)
+            rwbodyBox.push({ type: `http-${type}-jq`, regex, value: quoteSurgeJq(file.value), stashValue: file.value })
           }
-        }
-        if (value) {
+        } else if (value) {
           value = value.replace(/\s+\/\//g, '//')
           rwbodyBox.push({
             type: `http-${type}-jq`,
@@ -3299,13 +3297,41 @@ function loonV2JsonReplaceExpression(path, value) {
   return `if ((getpath(${JSON.stringify(parent)}) // {}) | has(${lastJq})) then (setpath(${JSON.stringify(path)}; ${JSON.stringify(value)})) else . end`
 }
 
+// Loon 旧语法用 jq-path=URL 引用 jq 文件，有的插件也把它原样写进 v2 的 json.jq("jq-path=...")；
+// 两种写法都是文件引用而不是 jq 表达式。
+function getLoonJqPath(expression) {
+  const matched = `${expression ?? ''}`.trim().match(/^jq-path\s*=\s*(?:"([^"]*)"|'([^']*)'|(\S+))$/)
+  return matched ? matched[1] ?? matched[2] ?? matched[3] : null
+}
+
+// jq 文件内联为一行前必须去掉注释，否则行尾 # 注释会吞掉后面所有表达式；字符串中的 # 不是注释
+function stripJqComments(text) {
+  return text
+    .split(/\r?\n/)
+    .map(line => {
+      let inString = false
+      for (let i = 0; i < line.length; i++) {
+        const char = line[i]
+        if (inString) {
+          if (char === '\\') i++
+          else if (char === '"') inString = false
+        } else if (char === '"') {
+          inString = true
+        } else if (char === '#') {
+          return line.slice(0, i)
+        }
+      }
+      return line
+    })
+    .join('\n')
+}
+
 async function loadLoonV2JqFile(url) {
-  if (!/^https?:\/\//i.test(url)) return { reason: 'Surge 转换暂不支持本地 jq_file 路径' }
+  if (!/^https?:\/\//i.test(url)) return { reason: '暂不支持本地 jq 文件路径' }
   try {
     const response = await http(url, reqHeaders)
     const status = Number(response?.status ?? response?.statusCode ?? 0)
-    const text = `${response?.body ?? ''}`
-      .replace(/^\s*#.*$/gm, '')
+    const text = stripJqComments(`${response?.body ?? ''}`)
       .replace(/\r?\n/g, ' ')
       .trim()
     if ((status && status !== 200) || !text) return { reason: `jq_file 下载失败：HTTP ${status || '未知状态'}` }
@@ -3522,8 +3548,9 @@ async function normalizeLoonV2RewriteToSurge(line, targetApp, sourceNum, markOve
           return { unsupported: true, reason: parsedValue.reason || `${name} 参数必须是字符串` }
         }
         let expression = parsedValue.value
-        if (operation === 'jq_file') {
-          const file = await loadLoonV2JqFile(expression)
+        const jqPath = operation === 'jq' ? getLoonJqPath(expression) : null
+        if (operation === 'jq_file' || jqPath != null) {
+          const file = await loadLoonV2JqFile(jqPath ?? expression)
           if (file.reason) return { unsupported: true, reason: file.reason }
           expression = file.value
         }
@@ -4264,6 +4291,9 @@ function formatLegacyLoonV2BodyAction(phase, action, args, condition) {
 
   if (operation === 'jq' || operation === 'json-jq') {
     if (args.length === 0) return { unsupported: action + ' 缺少 jq 表达式' }
+    // jq-path=URL 是文件引用，对应 v2 的 json.jq_file
+    const jqPath = getLoonJqPath(args.join(' '))
+    if (jqPath != null) return { line: condition + ' then ' + phase + '.json.jq_file(' + JSON.stringify(jqPath) + ')' }
     const expression = formatLegacyLoonV2StringArgument(args.join(' '))
     return expression ? { line: condition + ' then ' + name + '(' + expression + ')' } : { unsupported: action + ' 的 jq 表达式无法转换' }
   }

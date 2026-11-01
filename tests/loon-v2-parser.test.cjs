@@ -1559,3 +1559,31 @@ test('Stash installs a Loon or Surge module URL directly and passes other client
     assert.equal(browser.body, '')
   }
 })
+
+test('jq-path references load the jq file instead of becoming a literal filter', async () => {
+  const jqUrl = 'https://example.com/filter.jq'
+  const jqFile = '# header\n.a = "x # not a comment" # trailing\n| del(.ad)\n'
+  const expected = '.a = "x # not a comment"  | del(.ad)'
+  const source = [
+    `response if \${url} ~= /^https:\\/\\/v2\\.example\\.com/ then response.json.jq("jq-path=${jqUrl}")`,
+    `^https:\\/\\/quoted\\.example\\.com response-body-json-jq jq-path="${jqUrl}"`,
+    `^https:\\/\\/bare\\.example\\.com response-body-json-jq jq-path=${jqUrl}`,
+  ].join('\n')
+  const stash = await convert(source, 'stash-stoverride', { [jqUrl]: jqFile })
+  assert.doesNotMatch(stash.body, /jq-path/)
+  for (const host of ['v2', 'quoted', 'bare']) {
+    assert.ok(stash.body.includes(`${host}\\.example\\.com response-jq ${expected}\n`), host)
+  }
+  assert.doesNotMatch(JSON.stringify(stash.notifications), /不支持以下内容/)
+
+  // A file that cannot be loaded is reported instead of emitting an empty filter.
+  const missing = await convert(source, 'stash-stoverride', {}, 'loon-plugin', {}, { httpStatus: 404 })
+  assert.doesNotMatch(missing.body, /response-jq/)
+  assert.match(JSON.stringify(missing.notifications), /jq_file 下载失败/)
+
+  // Loon -> Loon upgrades the legacy file reference to json.jq_file.
+  const loon = await convert(source, 'loon-plugin', { [jqUrl]: jqFile })
+  assert.match(loon.body, /quoted\\\.example\\\.com\/i? then response\.json\.jq_file\("https:\/\/example\.com\/filter\.jq"\)/)
+  assert.match(loon.body, /bare\\\.example\\\.com\/i? then response\.json\.jq_file\("https:\/\/example\.com\/filter\.jq"\)/)
+  assert.doesNotMatch(loon.body, /(?:quoted|bare)\\\.example\\\.com\/i? then response\.json\.jq\(/)
+})
