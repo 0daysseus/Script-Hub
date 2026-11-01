@@ -69,6 +69,13 @@ npm run test:loon-v2
 
 参考：[Loon Script v2 文档](https://nsloon.app/docs/Script/script_v2/)
 
+## Stash 覆写转换（Beta）
+
+- **直接安装**：启用 Beta Stash 模块后，可在 Stash 中直接安装 `.plugin`、`.lpx`、`.sgmodule` 链接（允许 GitHub 的 `?raw=true` 等查询参数），模块会把 Stash 自身发起的下载转换为覆写；浏览器等其他客户端的请求原样放行。支持 `raw.githubusercontent.com`（`github.com/.../blob/...?raw=true` 会跳转到这里）、`gist.githubusercontent.com`、`gitlab.com`、`cdn.jsdelivr.net`、`fastly.jsdelivr.net`、`kelee.one`；其他域名需把主机名加入模块的 MitM 与匹配规则，或继续使用 `script.hub` 转换链接。
+- **参数**：Surge `#!arguments`/`#!arguments-desc` 与 Loon `[Argument]` 转为 Stash 覆写参数（`arguments-version: 1`，iOS/tvOS 3.7+、macOS 4.4+），引用改为 `${args.name}`，可在 Stash 的「参数」中修改。Loon `select` 保留全部选项，`switch` 对应开关；单独作为脚本 `argument` 的布尔参数以字符串 `true`/`false` 选项声明，作为 `timeout` 的整数参数声明为 `value-type: integer`。旧版 Stash 可在转换链接加 `stashArgs=false`，按默认值写死。
+- **无法动态表达的部分**：Stash 脚本没有启停字段，`enable={参数}` 与 Surge 行首参数按默认值启用或注释，并给出提示；MitM 主机名参数的默认值含逗号时按默认值展开。
+- **其他映射**：`[Host]` → `hosts`（Loon `use-in-proxy=true` 同时写入 `proxy-hosts`；`server:`/`script:` 不支持）；文本/Base64 Map Local 与 Loon Mock → 原生 `mock`（远程文件仍使用 echo-response 脚本）；JSON 修改使用原生 jq Body Rewrite；Surge `[Panel]` 的标题、内容、图标、颜色、刷新间隔 → Tile；脚本 `engine=webview` → `webkit`；只保留 Stash 使用的元信息字段。
+
 ## 鸣谢
 
 Powered by [_@Chavy‘s_](https://github.com/chavyleung) [Env.js](https://github.com/chavyleung/scripts)  

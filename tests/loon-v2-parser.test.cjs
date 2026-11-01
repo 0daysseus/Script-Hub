@@ -16,7 +16,7 @@ async function convert(source, target, httpBodies = {}, sourceType = 'loon-plugi
     .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
     .join('&')
   const sourceUrl = runtime.sourceUrl || 'http://local.text'
-  const requestUrl = `https://script.hub/file/_start_/${sourceUrl}/_end_/?type=${sourceType}&target=${target}&localtext=${encoded}${extraQuery ? `&${extraQuery}` : ''}`
+  const requestUrl = runtime.requestUrl || `https://script.hub/file/_start_/${sourceUrl}/_end_/?type=${sourceType}&target=${target}&localtext=${encoded}${extraQuery ? `&${extraQuery}` : ''}`
 
   const context = {
     console: {
@@ -80,6 +80,23 @@ async function convert(source, target, httpBodies = {}, sourceType = 'loon-plugi
   return { body, notifications, logs }
 }
 
+// Stash http.mock entries are written as JSON strings, which are also YAML double-quoted scalars.
+function stashMockEntries(body) {
+  const quoted = '("(?:[^"\\\\]|\\\\.)*")'
+  const pattern = new RegExp(
+    `(#?)\\s*- match: ${quoted}\\n#?\\s+(text|base64): ${quoted}(?:\\n#?\\s+status-code: (\\d+))?(?:\\n#?\\s+headers:\\n#?\\s+"Content-Type": ${quoted})?`,
+    'g'
+  )
+  return [...body.matchAll(pattern)].map(match => ({
+    disabled: match[1] === '#',
+    match: JSON.parse(match[2]),
+    kind: match[3],
+    value: JSON.parse(match[4]),
+    status: match[5] ? Number(match[5]) : undefined,
+    type: match[6] ? JSON.parse(match[6]) : undefined,
+  }))
+}
+
 function sectionLines(body, sectionName) {
   const headers = ['[Rule]', '[Rewrite]', '[Script]', '[Body Rewrite]', '[Header Rewrite]', '[Map Local]', '[MITM]']
   const header = `[${sectionName}]`
@@ -115,8 +132,8 @@ test('native Rewrite actions use the supported target matrix without losing rule
       assert.match(body, /response-replace-regex.*old.*new/)
       assert.match(body, /header-rewrite:[\s\S]*response-add/)
       assert.match(body, /body response-replace-regex old new/)
-      assert.match(body, /echoResponse/)
-      assert.doesNotMatch(body, /reject-dict/)
+      assert.deepEqual(stashMockEntries(body).map(({ match, value, status }) => [match, value, status]), [['mock', '{}', 201]])
+      assert.doesNotMatch(body, /reject-dict|echoResponse/)
     } else {
       assert.equal(sectionLines(body, 'Map Local').length, 1)
       assert.equal(sectionLines(body, 'Body Rewrite').length, 2)
@@ -127,7 +144,7 @@ test('native Rewrite actions use the supported target matrix without losing rule
   assert.match(JSON.stringify(unknown.notifications), /当前目标不支持转换：unknown-module/)
 })
 
-test('Stash Map Local preserves exact status, escaped text, and remote URLs in executable echo arguments', async () => {
+test('Stash Map Local preserves exact status and escaped text in native mocks and remote URLs in echo arguments', async () => {
   const entries = [
     ['reject_array(404)', '[]', 'text', 404, 'application/json'],
     ['reject(503, "x")', 'x', 'text', 503, 'text/plain'],
@@ -141,11 +158,18 @@ test('Stash Map Local preserves exact status, escaped text, and remote URLs in e
   const source = entries.map(([action], i) => `${action.startsWith('response.') ? 'response' : 'request'} if \${url} ~= /mock${i}/ then ${action}`).join('\n')
   const { body, notifications } = await convert(source, 'stash-stoverride')
   assert.doesNotMatch(JSON.stringify(notifications), /不支持以下内容/)
+  const mocks = stashMockEntries(body)
+  const textEntries = entries.filter(entry => entry[2] === 'text')
+  assert.equal(mocks.length, textEntries.length)
+  textEntries.forEach(([, value, , status, type], i) => {
+    assert.deepEqual(mocks[i], { disabled: false, match: `mock${i}`, kind: 'text', value, status, type })
+  })
   const args = [...body.matchAll(/argument: \|-\n\s+([^\n]+)/g)].map(match => match[1])
-  assert.equal(args.length, entries.length)
+  const urlEntries = entries.filter(entry => entry[2] === 'url')
+  assert.equal(args.length, urlEntries.length)
   const echo = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'echo-response.js'), 'utf8')
-  for (let i = 0; i < entries.length; i++) {
-    const [, value, kind, status, type] = entries[i]
+  for (let i = 0; i < urlEntries.length; i++) {
+    const [, value, kind, status, type] = urlEntries[i]
     const decoded = new URLSearchParams(decodeURIComponent(args[i]))
     assert.equal(decoded.get(kind), value)
     assert.equal(decoded.get('status-code'), String(status))
@@ -179,12 +203,12 @@ test('Stash maps canonical Loon reject_dict, reject_array, and empty reject to n
   assert.match(body, /- >-[\s\S]*dict-200 - reject-dict/)
   assert.match(body, /- >-[\s\S]*array-200 - reject-array/)
   assert.match(body, /- >-[\s\S]*empty-200 - reject-200/)
-  assert.doesNotMatch(body, /match: \(\?i\)(?:dict-200|array-200|empty-200)/)
-  // Non-200 and a real single-space body keep the exact echo-response path.
-  assert.match(body, /match: \(\?i\)dict-404/)
-  assert.match(body, /status-code%3D404/)
-  assert.match(body, /match: \(\?i\)space-200/)
-  assert.match(body, /text%3D%2520/)
+  assert.doesNotMatch(body, /match: "?\(\?i\)(?:dict-200|array-200|empty-200)/)
+  // Non-200 and a real single-space body keep their exact status and body as native mocks.
+  assert.deepEqual(stashMockEntries(body).map(({ match, value, status }) => [match, value, status]), [
+    ['(?i)dict-404', '{}', 404],
+    ['(?i)space-200', ' ', 200],
+  ])
   assert.doesNotMatch(JSON.stringify(notifications), /不支持以下内容/)
 })
 
@@ -199,8 +223,12 @@ test('Stash uses native reject only for exact empty text 404 mocks', async () =>
   const { body, notifications } = await convert(source, 'stash-stoverride')
   assert.match(body, /empty-404 - reject\n/)
   assert.match(body, /text-404 - reject\n/)
-  for (const name of ['space-404', 'json-404', 'body-404']) assert.ok(body.includes(`match: ${name}`))
-  assert.equal((body.match(/argument: \|-/g) || []).length, 3)
+  assert.deepEqual(stashMockEntries(body).map(({ match, value, status }) => [match, value, status]), [
+    ['space-404', ' ', 404],
+    ['json-404', '{}', 404],
+    ['body-404', 'custom', 404],
+  ])
+  assert.doesNotMatch(body, /argument: \|-/)
   assert.doesNotMatch(JSON.stringify(notifications), /不支持以下内容/)
 })
 
@@ -237,11 +265,12 @@ test('real Tieba object argument retains its key and enables the downstream vide
   const source = fs.readFileSync(path.join(__dirname, 'fixtures', 'tieba_remove_ads.lpx'), 'utf8')
   const stash = await convert(source, 'stash-stoverride')
   const argument = [...stash.body.matchAll(/argument: \|-\n\s+([^\n]+)/g)].map(match => match[1]).find(value => value.startsWith('per_filter_video_thread='))
-  const options = Object.fromEntries(argument.split('&').map(item => {
-    const [key, value] = item.split('=')
-    return [key, value === 'true' ? true : value === 'false' ? false : value]
-  }))
-  assert.equal(options.per_filter_video_thread, true)
+  assert.equal(argument, 'per_filter_video_thread=${args.per_filter_video_thread}')
+  // The Loon select keeps its string options and its default enables the video filter.
+  assert.match(
+    stash.body,
+    /arguments-version: 1\narguments:\n  per_filter_video_thread:\n    type: select\n    title: "拦截推荐页面视频帖"\n    description: "[^"]+"\n    default: "true"\n    options:\n      - value: "true"\n      - value: "false"/
+  )
   assert.doesNotMatch(JSON.stringify(stash.notifications), /不支持以下内容/)
   for (const target of ['surge-module', 'shadowrocket-module']) {
     const { body } = await convert(source, target)
@@ -262,10 +291,18 @@ test('Stash encodes object defaults without changing literal string arguments', 
   ].join('\n')
   const { body, notifications } = await convert(source, 'stash-stoverride')
   const args = [...body.matchAll(/argument: \|-\n\s+([^\n]+)/g)].map(match => match[1])
-  assert.equal(args[0], `first=${encodeURIComponent('a&b=c%20, d')}&second=${encodeURIComponent('引号"/空 格')}`)
-  assert.equal(new URLSearchParams(args[0]).get('first'), 'a&b=c%20, d')
+  // Override parameters reference user values; their defaults live in the declaration.
+  assert.equal(args[0], 'first=${args.first}&second=${args.second}')
+  assert.match(body, /  first:\n    type: input\n    title: "First"\n    default: "a&b=c%20, d"/)
+  assert.match(body, /  second:\n    type: input\n    title: "Second"\n    default: "引号\\"\/空 格"/)
   assert.equal(args[1], 'first=literal&second=x')
   assert.doesNotMatch(JSON.stringify(notifications), /不支持以下内容/)
+
+  // stashArgs=false keeps the previous fixed-default output for Stash versions without override parameters.
+  const legacy = await convert(source, 'stash-stoverride', {}, 'loon-plugin', { stashArgs: 'false' })
+  const legacyArgs = [...legacy.body.matchAll(/argument: \|-\n\s+([^\n]+)/g)].map(match => match[1])
+  assert.equal(legacyArgs[0], `first=${encodeURIComponent('a&b=c%20, d')}&second=${encodeURIComponent('引号"/空 格')}`)
+  assert.doesNotMatch(legacy.body, /arguments-version|\$\{args\./)
 })
 
 test('real HTTPDNS source preserves all four top-level USER-AGENT and logical rules', async () => {
@@ -341,43 +378,54 @@ test('Stash rejects control characters in body replacements without aborting lat
   }
 })
 
-test('Stash adapter failure rolls back mocks already converted from the same line', async () => {
+test('Stash adapter failure rolls back output already converted from the same line', async () => {
   const { body, notifications } = await convert([
-    'request if ${url} ~= /partial-adapter/ then reject(201, "ok") | reject_img(404)',
-    'response if ${url} ~= /partial-base64/ then response.header.add("X-Test", "yes") | response.body.mock("png", "YWJj", 200, true)',
+    'response if ${url} ~= /partial-file/ then response.header.add("X-Test", "yes") | response.body.mock_file("json", "local.json", 200)',
     'request if ${url} ~= /kept/ then redirect(302, "https://example.com/kept")',
   ].join('\n'), 'stash-stoverride')
-  assert.doesNotMatch(body, /partial-adapter|partial-base64|echoResponse|X-Test/)
+  assert.doesNotMatch(body, /partial-file|echoResponse|X-Test/)
   assert.match(body, /example.com\/kept/)
-  assert.match(JSON.stringify(notifications), /非 200 状态码/)
-  assert.match(JSON.stringify(notifications), /Base64/)
+  assert.match(JSON.stringify(notifications), /本地 Map Local/)
+})
+
+test('Stash native mocks keep non-200 tiny GIFs and Base64 bodies', async () => {
+  const { body, notifications } = await convert([
+    'request if ${url} ~= /gif-404/ then reject_img(404)',
+    'response if ${url} ~= /png-base64/ then response.header.add("X-Test", "yes") | response.body.mock("png", "YWJj", 201, true)',
+  ].join('\n'), 'stash-stoverride')
+  assert.deepEqual(stashMockEntries(body), [
+    { disabled: false, match: 'gif-404', kind: 'base64', value: 'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', status: 404, type: 'image/gif' },
+    { disabled: false, match: 'png-base64', kind: 'base64', value: 'YWJj', status: 201, type: 'image/png' },
+  ])
+  assert.match(body, /png-base64 response-add X-Test yes/)
+  assert.doesNotMatch(JSON.stringify(notifications), /不支持以下内容/)
 })
 
 test('Stash keeps commented intermediate mocks disabled and preserves their source notes', async () => {
   const source = '#request if ${url} ~= /disabled-mock/ then reject(404, "off")\n# retained note\nrequest if ${url} ~= /enabled-mock/ then reject(201, "on")'
   const { body } = await convert(source, 'stash-stoverride')
   assert.match(body, /# retained note/)
-  assert.match(body, /#\s+- match: disabled-mock/)
-  assert.match(body, /\n    - match: enabled-mock/)
+  assert.match(body, /#\s+- match: "disabled-mock"/)
+  assert.match(body, /# retained note\n    - match: "enabled-mock"/)
+  assert.deepEqual(stashMockEntries(body).map(({ disabled, match }) => [disabled, match]), [
+    [true, 'disabled-mock'],
+    [false, 'enabled-mock'],
+  ])
   const removed = await convert(source, 'stash-stoverride', {}, 'loon-plugin', { del: 'true' })
   assert.doesNotMatch(removed.body, /disabled-mock/)
 })
 
 test('Stash keeps real Rewrite and trigger limitations explicit', async () => {
   const { body, notifications } = await convert([
-    'request if ${url} ~= /bad-gif/ then reject_img(404)',
-    'response if ${url} ~= /bad-base64/ then response.body.mock("png", "YWJj", 200, true)',
     'response if ${url} ~= /bad-file/ then response.body.mock_file("json", "local.json", 200)',
     'response if ${url} ~= /bad-condition/ && ${response.status} == 200 then response.json.delete("ad")',
     'response if ${url} ~= /bad-space/ then response.body.replace(/old/, "two words")',
     'network-changed then script("https://example.com/event.js")',
     'request if ${url} ~= /good-gif/ then reject_img(200)',
   ].join('\n'), 'stash-stoverride')
-  assert.doesNotMatch(body, /bad-gif|bad-base64|bad-file|bad-condition|bad-space|event.js/)
+  assert.doesNotMatch(body, /bad-file|bad-condition|bad-space|event.js/)
   assert.match(body, /good-gif - reject-img/)
   const text = JSON.stringify(notifications)
-  assert.match(text, /非 200 状态码/)
-  assert.match(text, /Base64/)
   assert.match(text, /本地 Map Local/)
   assert.match(text, /包含空白/)
   assert.match(text, /无法等价转换|只转换单一/)
@@ -1383,4 +1431,131 @@ test('Beta Loon module uses native Loon v2 Script syntax', () => {
   assert.ok(scriptLines.some(line => /shadowrocket-module/.test(line)))
   assert.doesNotMatch(moduleText, /^http-request .*script-path=/m)
   assert.doesNotMatch(moduleText, /force-http-engine-hosts\s*=/)
+})
+
+test('Surge module arguments become Stash override parameters', async () => {
+  const source = [
+    '#!name=Args',
+    '#!system=ios',
+    '#!arguments=hostname:api.example.com,hosts:"a.example.com,b.example.com",region:HK,flag:true,ScriptOn:"",ScriptOff:"#",timeout:30',
+    '#!arguments-desc=hostname: MITM 主机\\nregion: 地区',
+    '[Header Rewrite]',
+    'http-request ^https:\\/\\/h\\.example\\.com header-replace X-Region {{{region}}}',
+    '[Body Rewrite]',
+    'http-response ^https:\\/\\/b\\.example\\.com "foo" "{{{region}}}"',
+    '[Script]',
+    '{{{ScriptOn}}}on = type=http-response, pattern=^https:\\/\\/on\\.example\\.com, script-path=https://example.com/on.js, timeout={{{timeout}}}, engine=webview, argument="region={{{region}}}&flag={{{flag}}}"',
+    '{{{ScriptOff}}}off = type=http-request, pattern=^https:\\/\\/off\\.example\\.com, script-path=https://example.com/off.js',
+    'sole = type=cron, cronexp="0 8 * * *", script-path=https://example.com/cron.js, argument={{{flag}}}',
+    '[MITM]',
+    'hostname = %APPEND% {{{hostname}}}, {{{hosts}}}',
+  ].join('\n')
+  const { body, notifications } = await convert(source, 'stash-stoverride', {}, 'surge-module')
+  assert.doesNotMatch(body, /^(?:system|arguments-desc):/m)
+  assert.match(body, /  hostname:\n    type: input\n    title: "MITM 主机"\n    default: "api.example.com"/)
+  assert.match(body, /  region:\n    type: input\n    title: "地区"\n    default: "HK"/)
+  // A Boolean used alone as a string argument must stay a string.
+  assert.match(body, /  flag:\n    type: select\n    title: "flag"\n    default: "true"\n    options:\n      - value: "true"\n      - value: "false"/)
+  assert.match(body, /  timeout:\n    type: input\n    title: "timeout"\n    value-type: integer\n    default: 30/)
+  assert.doesNotMatch(body, /^  (?:hosts|ScriptOn|ScriptOff):/m)
+  assert.match(body, /mitm:\n    - "\$\{args\.hostname\}"\n    - "a\.example\.com"\n    - "b\.example\.com"/)
+  assert.match(body, /h\\\.example\\\.com request-replace X-Region \$\{args\.region\}/)
+  assert.match(body, /b\\\.example\\\.com response-replace-regex foo \$\{args\.region\}\n/)
+  assert.match(body, /- match: \^https:\\\/\\\/on[^\n]*\n      name: "on_\d+"\n      type: response\n      engine: webkit\n      timeout: \$\{args\.timeout\}\n      argument: \|-\n        region=\$\{args\.region\}&flag=\$\{args\.flag\}/)
+  assert.match(body, /#    - match: \^https:\\\/\\\/off/)
+  assert.match(body, /argument: \|-\n        \$\{args\.flag\}/)
+  const text = JSON.stringify(notifications)
+  assert.match(text, /参数 ScriptOff 动态启停脚本，已按默认值禁用/)
+  assert.match(text, /参数 hosts 已按默认值展开/)
+})
+
+test('Loon Argument types, lists, and dynamic enable map to Stash parameters', async () => {
+  const source = [
+    '[Argument]',
+    'region = select,"CN","US",tag=地区,desc=选择地区',
+    'enabled = switch,true,tag=启用',
+    'disabled = switch,false,tag=停用',
+    'level = select,1,2,type=number,tag=等级',
+    'cronExp = input,"0 8 * * *",tag=执行时间',
+    '[Script]',
+    'http-response ^https:\\/\\/a\\.example\\.com script-path=https://example.com/a.js, tag=A, argument=[{region},{level},{enabled}], enable={enabled}',
+    'cron {cronExp} script-path=https://example.com/c.js, tag=C',
+    'request if ${url} ~= /^https:\\/\\/v2\\.example\\.com/ then script("https://example.com/v2.js", {${region}}) with enable=${disabled}, tag="V2"',
+  ].join('\n')
+  const { body, notifications } = await convert(source, 'stash-stoverride')
+  assert.match(body, /  region:\n    type: select\n    title: "地区"\n    description: "选择地区"\n    default: "CN"\n    options:\n      - value: "CN"\n      - value: "US"/)
+  assert.match(body, /  level:\n    type: select\n    title: "等级"\n    default: "1"\n    options:\n      - value: "1"\n      - value: "2"/)
+  assert.match(body, /  enabled:\n    type: switch\n    title: "启用"\n    default: true/)
+  assert.match(body, /argument: \|-\n        region=\$\{args\.region\}&level=\$\{args\.level\}&enabled=\$\{args\.enabled\}/)
+  assert.match(body, /cron: \$\{args\.cronExp\}/)
+  assert.match(body, /\n    - match: \^https:\\\/\\\/a\\\.example/)
+  assert.match(body, /#    - match: \^https:\\\/\\\/v2\\\.example/)
+  assert.doesNotMatch(body, /"V2_\d+":/)
+  const text = JSON.stringify(notifications)
+  assert.match(text, /参数 enabled 动态启停脚本，已按默认值启用/)
+  assert.match(text, /参数 disabled 动态启停脚本，已按默认值禁用/)
+
+  // Loon -> Loon keeps every select option and the declared number type.
+  const loon = await convert(source, 'loon-plugin')
+  assert.match(loon.body, /region=select,"CN","US",tag=地区/)
+  assert.match(loon.body, /level=select,1,2,type=number,tag=等级/)
+})
+
+test('Stash hosts, panels, metadata, quoted headers, and empty sections', async () => {
+  const surge = await convert([
+    '#!name=Hosts',
+    '#!homepage=https://example.com',
+    '#!requirement=CORE_VERSION>=20',
+    '[Host]',
+    'one.example.com = 1.2.3.4',
+    '*.multi.example.com = 1.1.1.1, 2.2.2.2',
+    'dns.example.com = server:8.8.8.8',
+    '[Panel]',
+    'info = script-name=info, title="网络信息", content="加载中", icon=wifi, icon-color=#ff0000, update-interval=600',
+    '[Script]',
+    'info = type=generic, script-path=https://example.com/info.js, argument=a=1',
+    'off = type=http-request, pattern=^https:\\/\\/off, script-path=https://example.com/off.js, enable=false',
+  ].join('\n'), 'stash-stoverride', {}, 'surge-module')
+  assert.match(surge.body, /^homepage: \|-/m)
+  assert.doesNotMatch(surge.body, /^requirement:/m)
+  assert.match(surge.body, /hosts:\n  "one\.example\.com": "1\.2\.3\.4"\n  "\*\.multi\.example\.com": \["1\.1\.1\.1", "2\.2\.2\.2"\]/)
+  assert.match(JSON.stringify(surge.notifications), /dns\.example\.com = server:8\.8\.8\.8/)
+  assert.match(surge.body, /tiles:\n  - name: "info_\d+"\n    interval: 600\n    title: "网络信息"\n    content: "加载中"\n    icon: "wifi"\n    backgroundColor: "#ff0000"/)
+  // Every request script is disabled, so the script key and its http parent must not become YAML null.
+  assert.doesNotMatch(surge.body, /^\s*script:\s*$/m)
+  assert.doesNotMatch(surge.body, /^http:\s*$/m)
+
+  const loon = await convert([
+    '[Host]',
+    'proxy.example.com = 5.6.7.8, use-in-proxy=true',
+    '[Rewrite]',
+    '^https:\\/\\/h\\.example\\.com header-replace User-Agent Unknown',
+    '[MITM]',
+    'hostname = h.example.com',
+  ].join('\n'), 'stash-stoverride')
+  assert.match(loon.body, /hosts:\n  "proxy\.example\.com": "5\.6\.7\.8"/)
+  assert.match(loon.body, /proxy-hosts:\n  "proxy\.example\.com": "5\.6\.7\.8"/)
+  assert.match(loon.body, /h\\\.example\\\.com request-replace User-Agent Unknown\n/)
+})
+
+test('Stash installs a Loon or Surge module URL directly and passes other clients through', async () => {
+  const source = '#!name=Direct\n[Rule]\nDOMAIN,ad.example.com,REJECT'
+  for (const [requestUrl, type] of [
+    ['https://raw.githubusercontent.com/u/r/main/Direct.plugin', 'loon'],
+    ['https://raw.githubusercontent.com/u/r/main/Direct.lpx?raw=true', 'loon'],
+    ['https://github.com/u/r/blob/main/Direct.sgmodule?raw=true', 'surge'],
+  ]) {
+    const stash = await convert('', 'unused', { [requestUrl]: source }, 'unused', {}, {
+      requestUrl,
+      requestHeaders: { 'User-Agent': 'Stash/3.7.0 Clash/1.9.0' },
+    })
+    assert.match(stash.body, /^name: \|-\n  Direct/m, `${type} ${requestUrl}`)
+    assert.match(stash.body, /rules:\n  - DOMAIN,ad\.example\.com,REJECT/)
+
+    const browser = await convert('', 'unused', { [requestUrl]: source }, 'unused', {}, {
+      requestUrl,
+      requestHeaders: { 'user-agent': 'script-hub/1.0.0' },
+    })
+    assert.equal(browser.body, '')
+  }
 })

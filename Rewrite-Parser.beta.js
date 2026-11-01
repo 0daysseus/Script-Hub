@@ -30,10 +30,12 @@ if (typeof $argument != 'undefined') {
 const HTTP_TIMEOUT = ($.getval('Parser_http_timeout') ?? 20) * 1000
 
 const url = $request.url
-const req = url.split(/file\/_start_\//)[1].split(/\/_end_\//)[0]
-const reqArr = req.match('%F0%9F%98%82') ? req.split('%F0%9F%98%82') : [req]
+// Stash 直接安装：在 Stash 中直接添加 .plugin/.lpx/.sgmodule 链接时由 MitM 脚本拦截并转换为覆写
+const directInstall = parseDirectInstallRequest(url, $request.headers)
+const req = directInstall ? directInstall.source : url.split(/file\/_start_\//)[1].split(/\/_end_\//)[0]
+const reqArr = directInstall ? [req] : req.match('%F0%9F%98%82') ? req.split('%F0%9F%98%82') : [req]
 //$.log("原始链接：" + req);
-const urlArg = url.split(/\/_end_\//)[1]
+const urlArg = directInstall ? directInstall.urlArg : url.split(/\/_end_\//)[1]
 
 //获取参数
 const queryObject = parseQueryString(urlArg)
@@ -67,6 +69,8 @@ if (/^开启(?:通知)?$/.test(localsetNtf)) noNtf = false
 else if (/^关闭(?:通知)?$/.test(localsetNtf)) noNtf = true
 
 let jqEnabled = istrue(queryObject.jqEnabled)
+// Stash 3.7+ 覆写参数；stashArgs=false 时按默认值写死，兼容旧版 Stash
+let stashArgsEnabled = queryObject.stashArgs == undefined ? true : istrue(queryObject.stashArgs)
 let openMsgHtml = istrue(queryObject.openMsgHtml)
 
 noNtf = openMsgHtml ? true : noNtf
@@ -294,17 +298,24 @@ let MapLocal = []
 let script = []
 let cron = []
 let providers = []
+let stashHosts = [] //Stash hosts
+let stashProxyHosts = [] //Stash proxy-hosts
+let stashMocks = [] //Stash 原生 mock
 
 hnBox = hnAdd != null ? hnAdd : []
 
 const jsRegex =
   /\s*[=,]\s*(?:script-path|pattern|timeout|argument|script-update-interval|requires-body|max-size|ability|binary-body-mode|cronexpr?|wake-system|enabled?|engine|tag|type|img-url|icon|debug|event-name|desc)\s*=\s*/
 
-const panelRegex = /\s*[=,]\s*(?:title|content|style|script-name|update-interval)\s*=\s*/
+const panelRegex = /\s*[=,]\s*(?:title|content|style|script-name|update-interval|icon|icon-color)\s*=\s*/
 
 const policyRegex = /^(direct|reject-?(img|video|dict|array|drop|200|tinygif)?(-no-drop)?|\{\{\{[^,]+\}\}\})$/i
 
 const mockRegex = /\s+(?:data-type|status-code|header|data|data-path|mock-data-is-base64)\s*=/
+
+const STASH_META_KEYS = ['name', 'desc', 'openUrl', 'author', 'homepage', 'icon', 'category', 'date', 'version']
+const STASH_ARGUMENTS_PLACEHOLDER = '#__SCRIPT_HUB_STASH_ARGUMENTS__'
+const TINY_GIF_BASE64 = 'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'
 
 //查询js binarymode相关
 let binaryInfo = $.getval('Parser_binary_info')
@@ -315,6 +326,8 @@ if (binaryInfo != null && binaryInfo.length > 0) {
 }
 
 !(async () => {
+  // 非 Stash 发起的请求（浏览器、Script Hub 自身拉取源文件）原样放行，避免误改或循环拦截
+  if (directInstall?.passthrough) return $.done({})
   if (!['surge-module', 'shadowrocket-module', 'loon-plugin', 'stash-stoverride'].includes(targetApp)) {
     throw new Error(`当前目标不支持转换：${targetApp || '未知目标'}`)
   }
@@ -672,7 +685,7 @@ if (binaryInfo != null && binaryInfo.length > 0) {
       let [_, regex, type, value] = _x.match(
         /^(.*?)\s+?(?:url\s+?jsonjq-)?(request|response)-body(?:-json-jq)?\s+?(.*?)\s*$/
       )
-      if (jqEnabled && (isSurgeiOS || isStashiOS || isShadowrocket)) {
+      if ((jqEnabled || isStashiOS) && (isSurgeiOS || isStashiOS || isShadowrocket)) {
         const jqPath = value.match(/jq-path="(.+?)"/)?.[1]
         if (jqPath) {
           if (/^https?:\/\//.test(jqPath)) {
@@ -733,7 +746,7 @@ if (binaryInfo != null && binaryInfo.length > 0) {
       const jsptn = regex
       let args = [[action, newSuffixArray]]
 
-      if (jqEnabled && (isSurgeiOS || isStashiOS || isShadowrocket)) {
+      if ((jqEnabled || isStashiOS) && (isSurgeiOS || isStashiOS || isShadowrocket)) {
         if (action === 'json-add') {
           newSuffixArray.forEach(item => {
             const paths = parseJsonPath(item[0])
@@ -762,7 +775,10 @@ if (binaryInfo != null && binaryInfo.length > 0) {
             })
           })
         } else {
-          newSuffixArray = newSuffixArray.map(item => item.join(' '))
+          // \x20 已还原为空格，含空白或为空的参数需要加引号，否则会被拆成多个参数
+          newSuffixArray = newSuffixArray.map(item =>
+            item.map(value => (value === '' || /\s/.test(value) ? quoteSurgeField(value) : value)).join(' ')
+          )
           rwbodyBox.push({ type: jstype, regex: jsptn, value: newSuffixArray.join(' ') })
         }
       } else if (jqEnabled && isLooniOS) {
@@ -917,6 +933,8 @@ if (binaryInfo != null && binaryInfo.length > 0) {
         style,
         scriptname,
         updatetime,
+        icon: getJsInfo(x, /[=,\s]\s*icon\s*=\s*/),
+        iconColor: getJsInfo(x, /[=,\s]\s*icon-color\s*=\s*/),
         toggleKey: !leadingTemplateIsNameOnly ? leadingTemplate?.key || '' : '',
         ori: x,
         num: y,
@@ -1271,6 +1289,8 @@ if (binaryInfo != null && binaryInfo.length > 0) {
           } else if (isLooniOS && key == 'arguments-desc') {
             continue
           }
+          // 覆写顶层的其他键会被合并进 Stash 配置，只保留 Stash 用于展示的元信息
+          if (isStashiOS && !STASH_META_KEYS.includes(key)) continue
           let info = !isStashiOS ? '#!' + key + '=' + value : key + ': |-\n  ' + value
           !delsystem && modInfo.push(info)
         }
@@ -1552,6 +1572,14 @@ if (binaryInfo != null && binaryInfo.length > 0) {
         }
         let hdtype = isResponseHeaderRewrite ? ' response-' : ' request-'
         x = x.replace(/^http-(?:request|response)\s+/, '').replace(/\s+header-/, hdtype)
+        // Stash 按空白分隔 Header 名称和正则，最后一个参数(值)取到行尾；Surge 的引号需要去掉
+        const [, hdprefix, hdargs] = x.match(/^(\S+\s+\S+)\s*(.*)$/) || [, x, '']
+        const hdfields = splitLegacyLoonV2Fields(hdargs).map(unquoteStashField)
+        if (hdfields.slice(0, -1).some(field => !field || /\s/.test(field))) {
+          otherRule.push(`${rwhdBox[i].x} [Stash Header Rewrite 无法表示包含空白的名称或正则]`)
+          break
+        }
+        x = [hdprefix, ...hdfields].join(' ')
         HeaderRewrite.push(stashMark + `${noteK4}- >-${noteKn6}` + x)
         break
       }
@@ -1568,7 +1596,17 @@ if (binaryInfo != null && binaryInfo.length > 0) {
     const useInProxy = hostBox[i].useInProxy ?? useLocalHostItemForProxy
     const loonHostOptions = isLooniOS && useInProxy != null ? `, use-in-proxy=${useInProxy}` : ''
     if (isStashiOS) {
-      otherRule.push(ori)
+      // Stash hosts 只支持 IP 或域名(CNAME)，不支持 server:/script: 形式的 DNS 指定
+      const values = hostvalue.split(/\s*,\s*/).filter(Boolean)
+      if (values.length > 0 && values.every(value => /^(?:[0-9a-f:.]+|[-*.\w]+)$/i.test(value))) {
+        const line = `${noteK}  ${JSON.stringify(hostdomain.replace(/^#/, ''))}: ${
+          values.length > 1 ? `[${values.map(value => JSON.stringify(value)).join(', ')}]` : JSON.stringify(values[0])
+        }`
+        stashHosts.push(mark + line)
+        useInProxy == 'true' && stashProxyHosts.push(mark + line)
+      } else {
+        otherRule.push(ori)
+      }
     } else if (isLooniOS && /script\s*:\s*/.test(hostvalue)) {
       otherRule.push(ori)
     } else if (isSurgeiOS || isShadowrocket || isLooniOS) {
@@ -1645,9 +1683,14 @@ if (binaryInfo != null && binaryInfo.length > 0) {
       style = panelBox[i].style ? ',style=' + panelBox[i].style : ''
       scriptname = panelBox[i].scriptname
       updatetime = panelBox[i].updatetime ? ', update-interval=' + panelBox[i].updatetime : ''
+      const panelIcon =
+        (panelBox[i].icon ? ', icon=' + panelBox[i].icon : '') +
+        (panelBox[i].iconColor ? ', icon-color=' + panelBox[i].iconColor : '')
       ori = panelBox[i].ori
       scriptname = reJsValue(njsnametarget || 'null', njsname, scriptname, ori, scriptname)
-      Panel.push(mark + noteK + panelname + ' = ' + 'script-name=' + scriptname + title + content + style + updatetime)
+      Panel.push(
+        mark + noteK + panelname + ' = ' + 'script-name=' + scriptname + title + content + style + panelIcon + updatetime
+      )
     } //for
   } //panel输出结束
 
@@ -1871,6 +1914,7 @@ if (binaryInfo != null && binaryInfo.length > 0) {
 
     for (let i = 0; i < jsBox.length; i++) {
       let url = jsBox[i].jsurl
+      jsBox[i].sourceName = jsBox[i].jsname
       jsBox[i].jsname = jsBox[i].jsname + '_' + jsBox[i].num
 
       if (urlMap[url]) {
@@ -1881,9 +1925,8 @@ if (binaryInfo != null && binaryInfo.length > 0) {
     }
 
     for (let i = 0; i < jsBox.length; i++) {
-      const stashEnable = `${jsBox[i].jsenable ?? ''}`.trim()
-      const stashDynamicEnable = jsBox[i].loonV2 && stashEnable && !/^(true|false)$/i.test(stashEnable)
-      const stashDisabled = /^(false|0|off|no)$/i.test(stashEnable) || stashDynamicEnable
+      const stashEnable = resolveStashScriptEnable(jsBox[i])
+      const stashDisabled = /^(false|0|off|no|#)$/i.test(stashEnable)
       const stashCommented = jsBox[i].noteK == '#' || stashDisabled
       if (!stashCommented) {
         noteKn8 = '\n        '
@@ -1924,10 +1967,15 @@ if (binaryInfo != null && binaryInfo.length > 0) {
         if (pairs.length > 0) {
           jsarg = pairs.map(({ scriptKey, templateKey }) => {
             const item = sgArg.find(item => item.key === templateKey)
+            // 由 applyStashArguments 转为 ${args.xxx}；关闭覆写参数时退回编码后的默认值
+            if (stashArgsEnabled && item && item.noteK != '#') return `${scriptKey}={${templateKey}}`
             const value = unwrapLoonV2String(splitTopLevel(item?.value || '', ',')[0]) ?? getArgumentDefaultValue(item)
             return `${scriptKey}=${encodeURIComponent(value)}`
           }).join('&')
         }
+      } else if (isLoonArgumentList(jsarg)) {
+        // Loon 旧式 [{a},{b}] 与转 Surge 时一致，按 a=...&b=... 传给脚本
+        jsarg = getLoonArgumentKeys(jsarg).map(key => `${key}={${key}}`).join('&')
       }
 
       cronexp = reJsValue(nCron || 'null', ncronexp, jsname, ori, cronexp)
@@ -1936,7 +1984,10 @@ if (binaryInfo != null && binaryInfo.length > 0) {
 
       timeout = reJsValue(timeoutt || 'null', timeoutv, jsname, ori, timeout)
 
-      engine = reJsValue(enginet || 'null', enginev, jsname, ori, engine)
+      engine = reJsValue(enginet || 'null', enginev, jsname, ori, jsBox[i].engine || '')
+      // Surge 的 webview 对应 Stash 的 webkit；Stash 只为 request/response 脚本提供 engine
+      engine = { auto: 'auto', jsc: 'jsc', webkit: 'webkit', webview: 'webkit' }[`${engine}`.trim().toLowerCase()]
+      engine = engine && /request|response/.test(jstype) ? noteKn6 + 'engine: ' + engine : ''
 
       jsarg =
         jsarg && jstype == 'generic'
@@ -1968,6 +2019,7 @@ if (binaryInfo != null && binaryInfo.length > 0) {
             rebody +
             size +
             proto +
+            engine +
             timeout +
             jsarg
         )
@@ -1982,11 +2034,20 @@ if (binaryInfo != null && binaryInfo.length > 0) {
         }
       }
       if (jstype == 'generic') {
+        // Surge 的 Panel 通过 script-name 引用 generic 脚本，其标题、内容、图标和刷新间隔对应 Stash Tile
+        const panel = panelBox.find(item => item.scriptname === jsBox[i].sourceName)
+        const tileField = (key, value) => (value ? `${noteKn4}${key}: ${JSON.stringify(stripWrapQuote(value))}` : '')
+        const tileInterval = /^\d+$/.test(`${panel?.updatetime ?? ''}`.trim()) ? panel.updatetime.trim() : '3600'
         ;/^generic\s/.test(ori) && !loonV2NormalizedLines.has(ori)
           ? otherRule.push(ori)
           : tiles.push(
               mark +
-                `${noteK2}- name: "${jsname}"${noteKn4}interval: 3600${noteKn4}title: "${jsname}"${noteKn4}icon: "${tilesicon}"${noteKn4}backgroundColor: "${tilescolor}"${timeout}${jsarg}`
+                `${noteK2}- name: "${jsname}"${noteKn4}interval: ${tileInterval}` +
+                tileField('title', panel?.title || jsBox[i].sourceName) +
+                tileField('content', panel?.content) +
+                tileField('icon', panel?.icon || tilesicon) +
+                tileField('backgroundColor', panel?.iconColor || tilescolor) +
+                `${timeout}${jsarg}`
             )
         ;/^generic\s/.test(ori) && !loonV2NormalizedLines.has(ori)
           ? ''
@@ -2087,12 +2148,19 @@ ${MITM}
       let StashBodyRewrite = []
       for (let i = 0; i < rwbodyBox.length; i++) {
         const { type, regex, value, stashValue, mark = '', noteK = '' } = rwbodyBox[i]
-        const line = `${normalizeTargetUrlPattern(regex)} ${type.replace(/^http-/, '').replace(/^(request|response)$/, '$1-replace-regex')} ${
-          stashValue ?? value.replace(/^"(.+)"$/, '$1').replace(/^'(.+)'$/, '$1')
-          //.split(' ')
-          //.map(i => i.replace(/^"(.+)"$/, '$1').replace(/^'(.+)'$/, '$1'))
-          //.join(' ')
-        }`
+        let expression = stashValue
+        if (expression == null && /-jq$/.test(type)) {
+          expression = value.replace(/^"(.+)"$/, '$1').replace(/^'(.+)'$/, '$1')
+        } else if (expression == null) {
+          // Surge 用引号包裹含空格的正则/替换值；Stash 按空白分隔参数，需逐个去掉引号
+          const fields = splitLegacyLoonV2Fields(value).map(unquoteStashField)
+          if (fields.length % 2 !== 0 || fields.some(field => !field || /\s/.test(field))) {
+            otherRule.push(`${type} ${regex} ${value} [Stash 正则 Body Rewrite 无法可靠表示空参数或包含空白的参数]`)
+            continue
+          }
+          expression = fields.join(' ')
+        }
+        const line = `${normalizeTargetUrlPattern(regex)} ${type.replace(/^http-/, '').replace(/^(request|response)$/, '$1-replace-regex')} ${expression}`
         const disabled = noteK === '#' || mark === '#'
         StashBodyRewrite.push(
           disabled
@@ -2104,8 +2172,11 @@ ${MITM}
         StashBodyRewrite = `  body-rewrite:\n${StashBodyRewrite.join('\n')}`
       }
 
+      stashMocks = (stashMocks[0] || '') && `  mock:\n${stashMocks.join('\n')}`
+
       if (
         StashBodyRewrite.length > 0 ||
+        stashMocks.length > 0 ||
         URLRewrite.length > 0 ||
         script.length > 0 ||
         HeaderRewrite.length > 0 ||
@@ -2124,6 +2195,8 @@ ${URLRewrite}
 
 ${StashBodyRewrite}
 
+${stashMocks}
+
 ${script}
 `
       }
@@ -2134,7 +2207,17 @@ ${script}
 
       providers = (providers[0] || '') && `script-providers:\n${providers.join('\n')}`
 
+      stashHosts = (stashHosts[0] || '') && `hosts:\n${stashHosts.join('\n')}`
+
+      stashProxyHosts = (stashProxyHosts[0] || '') && `proxy-hosts:\n${stashProxyHosts.join('\n')}`
+
       body = `${modInfo}
+
+${STASH_ARGUMENTS_PLACEHOLDER}
+
+${stashHosts}
+
+${stashProxyHosts}
 
 ${rules}
 
@@ -2154,13 +2237,8 @@ ${providers}
     isSurgeiOS || isShadowrocket
       ? new Set([...body.matchAll(/\{\{\{([^{}]+)\}\}\}/g)].map(item => item[1].trim()).filter(Boolean))
       : new Set()
-  if (isStashiOS && sgArg.length > 0) {
-    body = body.replaceAll('{{{', '{').replaceAll('}}}', '}')
-    for (let i = 0; i < sgArg.length; i++) {
-      let e = '{' + sgArg[i].key + '}'
-      let r = sgArg[i].value.split(',')[0]
-      body = body.replaceAll(e, r)
-    } //for
+  if (isStashiOS) {
+    body = commentEmptyStashKeys(applyStashArguments(body))
   } else if (isSurgeiOS || isShadowrocket) {
     body = body.replaceAll('{{{', '{').replaceAll('}}}', '}')
     for (let i = 0; i < sgArg.length; i++) {
@@ -2248,6 +2326,23 @@ ${providers}
   $.isQuanX() ? (result.status = 'HTTP/1.1 500') : (result.status = 500)
   done($.isQuanX() ? result : { response: result })
 })
+
+// A Stash override install requests the source URL itself instead of a
+// script.hub conversion link. Query strings such as GitHub's ?raw=true are not
+// part of the file name. Only Stash's own download is converted; the parser
+// fetches the same URL with its own User-Agent and must pass through.
+function parseDirectInstallRequest(requestUrl, headers = {}) {
+  if (/^https?:\/\/script\.hub\//i.test(requestUrl)) return null
+  const matched = `${requestUrl}`.split(/[?#]/)[0].match(/\/([^/]+)\.(plugin|lpx|sgmodule)$/i)
+  if (!matched) return null
+  const userAgent = Object.entries(headers || {}).find(([key]) => key.toLowerCase() === 'user-agent')?.[1] || ''
+  const type = matched[2].toLowerCase() === 'sgmodule' ? 'surge-module' : 'loon-plugin'
+  return {
+    passthrough: !/stash/i.test(userAgent),
+    source: requestUrl,
+    urlArg: `${matched[1]}.stoverride?type=${type}&target=stash-stoverride`,
+  }
+}
 
 function isLpxSource(sourceUrl) {
   return /\.lpx(?:[?#]|$)/i.test(String(sourceUrl ?? ''))
@@ -2708,9 +2803,8 @@ function normalizeLoonV2ScriptLine(line, targetApp) {
       const enable = normalizeLoonV2Boolean(value, targetApp)
       if (enable == null) return { unsupported: true, reason: 'enable 必须是 Boolean 或动态 Boolean 参数' }
       legacyOptions.push(`enable=${enable}`)
-      if (targetApp === 'stash-stoverride' && !/^(true|false)$/i.test(enable)) {
-        warnings.push('Stash 不支持动态 enable，已将对应脚本转换为注释')
-      } else if (targetApp === 'stash-stoverride' && enable === 'false') {
+      // 动态 enable 由 resolveStashScriptEnable 按参数默认值处理并给出提示
+      if (targetApp === 'stash-stoverride' && enable === 'false') {
         warnings.push('Stash 不支持 enable=false，已将对应脚本转换为注释')
       }
     } else if (key === 'debug') {
@@ -3294,7 +3388,7 @@ async function normalizeLoonV2RewriteLine(line, targetApp, sourceNum, markOverri
     return normalizeLoonV2RewriteToSurge(line, targetApp, sourceNum, markOverride)
   }
   // Commit all intermediate rules together; a failed later Action must not leave an active prefix.
-  const boxes = [MapLocal, rwBox, rwbodyBox, rwhdBox, jsBox]
+  const boxes = [MapLocal, rwBox, rwbodyBox, rwhdBox, jsBox, stashMocks]
   const lengths = boxes.map(box => box.length)
   let result
   try {
@@ -3624,7 +3718,12 @@ function formatLoonArgumentValue(item, type = item.type, isRuleToggle = false) {
     const switchDefault = isRuleToggle ? getToggleSwitchDefault(value) : getSwitchDefault(value)
     return switchDefault == 'true' ? 'true,false' : 'false,true'
   }
-  return quoteLoonInputValue(value)
+  // select 需要保留全部选项；type=number 的默认值和选项不能加引号
+  const isNumber = item.valueType == 'number'
+  const values = type == 'select' ? getArgumentOptions(item) : []
+  return (values.length > 0 ? values : [value])
+    .map(item => (isNumber ? stripWrapQuote(item) : quoteLoonInputValue(item)))
+    .join(',') + (item.valueType ? `,type=${item.valueType}` : '')
 }
 
 function isLoonArgumentList(str) {
@@ -4505,6 +4604,151 @@ function buildSurgeArgumentsDesc(args, ruleToggleArgs = new Map()) {
     .join('\\n\\n')
 }
 
+// Stash 脚本没有 enable 字段，覆写参数也只能替换值而不能注释整行。
+// 由参数控制的启停按参数默认值静态处理：Loon switch 为 false、Surge 行首参数为 # 时禁用。
+function resolveStashScriptEnable(item) {
+  const value = `${item.jsenable ?? ''}`.trim()
+  const key = getTemplateKeys(value.replace(/\$\{/g, '{'))[0]
+  if (!key) return value
+  const arg = sgArg.find(arg => arg.key === key)
+  const defaultValue = stripWrapQuote(splitTopLevel(`${arg?.value ?? ''}`, ',')[0] || '').trim()
+  // 未声明的参数没有默认值，不能静默启用
+  const enabled = !!arg && !/^(false|0|off|no|#.*)$/i.test(defaultValue)
+  targetCompatibilityWarnings.push(
+    `${item.ori} → Stash 无法用参数 ${key} 动态启停脚本，已按默认值${enabled ? '启用' : '禁用'}`
+  )
+  return enabled ? 'true' : 'false'
+}
+
+// 一个段落内的条目全部被注释时，只剩 `script:` 这样的空键会被解析为 null 并覆盖配置中的同名字段。
+// 自下而上处理，使 `http:` 这类只含空子段的父键也一并注释。
+function commentEmptyStashKeys(body) {
+  const lines = body.split('\n')
+  const indentOf = line => line.match(/^\s*/)[0].length
+  const isContent = line => line.trim() && !/^\s*#/.test(line)
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const matched = lines[i].match(/^(\s*)[^\s#-][^:]*:\s*$/)
+    if (!matched) continue
+    const indent = matched[1].length
+    const next = lines.slice(i + 1).find(isContent)
+    const hasChild = !!next && (indentOf(next) > indent || (indentOf(next) === indent && /^\s*- /.test(next)))
+    if (!hasChild) lines[i] = `#${lines[i]}`
+  }
+  return lines.join('\n')
+}
+
+// Stash 参数名以字母开头，只含字母、数字、下划线，最长 64 个字符
+function toStashArgumentName(key, usedNames) {
+  let name = `${key}`.replace(/[^A-Za-z0-9_]/g, '_')
+  if (!/^[A-Za-z]/.test(name)) name = `arg_${name}`
+  name = name.slice(0, 64)
+  for (let i = 2; usedNames.has(name); i++) name = `${name.slice(0, 60)}_${i}`
+  usedNames.add(name)
+  return name
+}
+
+// 只由一个引用组成的值会保留参数类型：脚本 argument 等字符串字段不能收到布尔或整数，
+// timeout 等数值字段则需要整数参数。
+function getStashArgumentUsage(body, name) {
+  const ref = `\${args.${name}}`
+  const usage = { stringSole: false, numericSole: false }
+  body.split('\n').forEach(line => {
+    if (!line.includes(ref)) return
+    const matched = line.replace(/^#?\s*(?:-\s+)?/, '').match(/^(?:([\w-]+):\s*)?(["']?)(.*)\2\s*$/)
+    if (!matched || matched[3] !== ref) return
+    if (/^(?:timeout|max-size|interval)$/.test(matched[1] || '')) usage.numericSole = true
+    else usage.stringSole = true
+  })
+  return usage
+}
+
+// 声明中的默认值和选项是展示给用户的实际值，Loon 引号字符串中的转义需要还原
+function decodeArgumentValue(value) {
+  return unwrapLoonV2String(value) ?? stripWrapQuote(value).trim()
+}
+
+function buildStashArgumentDeclaration(name, item, usage) {
+  const { tag, desc } = parseArgumentTagFields(item.tag)
+  const title = tag || item.key
+  const description = desc && desc !== title && desc !== item.key ? desc.replace(/\\n/g, '\n') : ''
+  const defaultValue = decodeArgumentValue(splitTopLevel(`${item.value ?? ''}`, ',')[0] || '')
+  const integerOnly = usage.numericSole && !usage.stringSole
+  const isInteger = value => /^-?\d+$/.test(value)
+  const lines = [`  ${name}:`]
+  const field = (key, value) => lines.push(`    ${key}: ${value}`)
+  const declareType = type => {
+    field('type', type)
+    field('title', JSON.stringify(title))
+    description && field('description', JSON.stringify(description))
+  }
+  if (item.type == 'switch' && !usage.stringSole && !usage.numericSole) {
+    declareType('switch')
+    field('default', getSwitchDefault(item.value))
+  } else if (item.type == 'switch' || item.type == 'select') {
+    let options = item.type == 'switch' ? ['true', 'false'] : getArgumentOptions(item)
+    if (options.length == 0) options = [defaultValue]
+    const selected = item.type == 'switch' ? getSwitchDefault(item.value) : options.includes(defaultValue) ? defaultValue : options[0]
+    const format = integerOnly && options.every(isInteger) ? value => value : value => JSON.stringify(value)
+    declareType('select')
+    field('default', format(selected))
+    lines.push('    options:')
+    options.forEach(value => lines.push(`      - value: ${format(value)}`))
+  } else {
+    declareType('input')
+    if (integerOnly && isInteger(defaultValue)) {
+      field('value-type', 'integer')
+      field('default', defaultValue)
+    } else {
+      field('default', JSON.stringify(defaultValue))
+    }
+  }
+  return lines
+}
+
+// Surge #!arguments 与 Loon [Argument] 转为 Stash 覆写参数(arguments-version: 1)，
+// {{{key}}}/{key}/${key} 引用改为 ${args.key}，未被引用的参数不声明。
+function applyStashArguments(body) {
+  if (sgArg.length == 0) return body.replace(STASH_ARGUMENTS_PLACEHOLDER, '')
+  body = body.replaceAll('{{{', '{').replaceAll('}}}', '}')
+  applySurgeArgumentsDesc(sgArg, modInfoObj['arguments-desc'])
+  const declarations = []
+  const usedNames = new Set()
+  for (const item of sgArg) {
+    const key = escapeRegExp(item.key)
+    const token = () => new RegExp(`(?<!\\{)\\$?\\{${key}\\}(?!\\})`, 'g')
+    if (!token().test(body)) continue
+    const defaultValue = getArgumentDefaultValue(item)
+    // MitM/force-http-engine 列表项在运行时不能拆分，逗号分隔的主机名参数按默认值展开
+    if (/,/.test(defaultValue)) {
+      const listItem = new RegExp(`^(#?\\s*- )"\\{${key}\\}"$`, 'gm')
+      if (listItem.test(body)) {
+        const hosts = defaultValue.split(/\s*,\s*/).filter(Boolean)
+        body = body.replace(listItem, (_, prefix) => hosts.map(host => `${prefix}"${host}"`).join('\n'))
+        targetCompatibilityWarnings.push(`Stash 的 MitM 主机名列表无法在运行时拆分，参数 ${item.key} 已按默认值展开`)
+      }
+      if (!token().test(body)) continue
+    }
+    if (!stashArgsEnabled || item.noteK == '#') {
+      body = body.replace(token(), () => defaultValue)
+      continue
+    }
+    const name = toStashArgumentName(item.key, usedNames)
+    body = body.replace(token(), () => `\${args.${name}}`)
+    declarations.push({ name, item })
+  }
+  const block =
+    declarations.length > 0
+      ? [
+          'arguments-version: 1',
+          'arguments:',
+          ...declarations.flatMap(({ name, item }) =>
+            buildStashArgumentDeclaration(name, item, getStashArgumentUsage(body, name))
+          ),
+        ].join('\n')
+      : ''
+  return body.replace(STASH_ARGUMENTS_PLACEHOLDER, block).replace(/\n{3,}/g, '\n\n')
+}
+
 function escapeRegExp(str) {
   return `${str}`.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
@@ -4803,12 +5047,26 @@ function getMockInfo(x, mark, y, exact = false) {
         return
       }
     }
+    const mockMark = { mark: mark === '#' ? '' : mark, noteK: mark === '#' ? '#' : '' }
     if (type === 'tiny-gif') {
-      if (status !== '200') return 'Stash reject-img 无法保留非 200 状态码'
-      rwBox.push({ mark: mark === '#' ? '' : mark, noteK: mark === '#' ? '#' : '', rwptn: pattern, rwvalue: '-', rwtype: 'reject-img' })
+      if (status !== '200') {
+        pushStashMock({ ...mockMark, pattern, base64: TINY_GIF_BASE64, status, headers: { 'Content-Type': 'image/gif' } })
+        return
+      }
+      rwBox.push({ ...mockMark, rwptn: pattern, rwvalue: '-', rwtype: 'reject-img' })
       return
     }
-    if (type === 'base64') return 'Stash echo-response 不支持解码 Base64 正文'
+    // Stash 原生 mock 直接返回文本或 Base64 正文，远程文件仍交给 echo-response 脚本拉取
+    if (type === 'base64' || type === 'text') {
+      pushStashMock({
+        ...mockMark,
+        pattern,
+        [type]: data,
+        status,
+        headers: { 'Content-Type': contentType || 'text/plain' },
+      })
+      return
+    }
     if (type === 'file' && !/^https?:\/\//i.test(data)) return 'Stash 无法读取本地 Map Local 资源文件'
     const argument = `${type === 'file' ? 'url' : 'text'}=${encodeURIComponent(data)}&status-code=${status}` +
       `&type=${encodeURIComponent(contentType || 'text/plain')}`
@@ -4987,25 +5245,52 @@ function getMockInfo(x, mark, y, exact = false) {
           num: y,
         })
       } else if (m2rType == null && mocktype != 'file') {
-        jsurl = 'https://raw.githubusercontent.com/Script-Hub-Org/Script-Hub/main/scripts/echo-response.js'
-        mockstatus = mockstatus ? '&status-code=' + mockstatus : ''
-        jsarg = `${mocktype}=` + encodeURIComponent(mockurl) + mockstatus
-        jsBox.push({
+        // Surge header="A:1|B:2" 对应 Stash mock 的 headers
+        const headers = Object.fromEntries(
+          `${mockheader ?? ''}`
+            .split('|')
+            .map(item => item.match(/^\s*([^:]+?)\s*:\s*(.*?)\s*$/))
+            .filter(Boolean)
+            .map(item => [item[1], item[2]])
+        )
+        pushStashMock({
           mark,
           noteK,
-          jsname,
-          jstype: 'http-request',
-          jsptn: mockptn,
-          jsurl,
-          jsarg,
-          timeout: '60',
-          ori: x,
-          num: y,
+          pattern: mockptn,
+          [mocktype == 'base64' || mockbase64 ? 'base64' : 'text']: `${mockurl ?? ''}`.replace(/\\(["\\])/g, '$1'),
+          status: mockstatus,
+          headers,
         })
       }
       break
   } //switch
 } //获取Mock参数
+
+// Surge/Loon 参数中的 "..." 由 quoteSurgeField 生成时可按 JSON 解码；用户手写的 "\d+" 不是合法 JSON，只去掉引号
+function unquoteStashField(field) {
+  if (/^".*"$/.test(field)) {
+    try {
+      return decodeSurgeQuotedField(field)
+    } catch (e) {
+      return field.slice(1, -1)
+    }
+  }
+  return stripWrapQuote(field)
+}
+
+// Stash http.mock 条目；JSON 字符串同时是合法的 YAML 双引号标量
+function pushStashMock({ mark = '', noteK = '', pattern, text, base64, status, headers = {} }) {
+  const c = noteK ? '#' : ''
+  const lines = [`${c}    - match: ${JSON.stringify(normalizeTargetUrlPattern(pattern))}`]
+  lines.push(base64 != null ? `${c}      base64: ${JSON.stringify(base64)}` : `${c}      text: ${JSON.stringify(text ?? '')}`)
+  if (/^\d+$/.test(`${status ?? ''}`)) lines.push(`${c}      status-code: ${status}`)
+  const headerEntries = Object.entries(headers).filter(([key, value]) => key && value)
+  if (headerEntries.length > 0) {
+    lines.push(`${c}      headers:`)
+    headerEntries.forEach(([key, value]) => lines.push(`${c}        ${JSON.stringify(key)}: ${JSON.stringify(value)}`))
+  }
+  stashMocks.push(mark + lines.join('\n'))
+}
 
 function istrue(str) {
   if (str == true || str == 1 || str == 'true' || str == '1') {
@@ -5083,13 +5368,16 @@ function parseArguments(str, noteK = '') {
     const key = rawKey.trim()
     const type = `${parts.shift() || ''}`.trim()
     const tagIndex = parts.findIndex(item => /^\s*(?:tag|desc)\s*=/.test(item))
-    const valueParts = tagIndex === -1 ? parts : parts.slice(0, tagIndex)
+    const declaredParts = tagIndex === -1 ? parts : parts.slice(0, tagIndex)
+    // Loon 的 type=string|number|boolean 是值类型声明，不是默认值或选项
+    const valueType = declaredParts.find(item => /^\s*type\s*=/.test(item))?.replace(/^\s*type\s*=\s*/, '').trim().toLowerCase() || ''
+    const valueParts = declaredParts.filter(item => !/^\s*type\s*=/.test(item))
     const tagParts = tagIndex === -1 ? [] : parts.slice(tagIndex)
     const value = type == 'select' ? valueParts[0] : valueParts.join(',')
     const options = normalizeArgumentOptions(valueParts)
     const tag = tagParts.join(', ') || `tag=${key}, desc=${key}`
 
-    sgArg.push({ key, value, type, options, tag, noteK })
+    sgArg.push({ key, value, type, valueType, options, tag, noteK })
 
     if (stripWrapQuote(value) == 'hostname') {
       hn2 = true

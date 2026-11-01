@@ -12,6 +12,13 @@ http:
   mitm:
     - "script.hub"
     - "*.script.hub"
+    # 直接安装 .plugin/.lpx/.sgmodule 链接时转换为覆写；仅转换 Stash 自身发起的下载
+    - "raw.githubusercontent.com"
+    - "gist.githubusercontent.com"
+    - "gitlab.com"
+    - "cdn.jsdelivr.net"
+    - "fastly.jsdelivr.net"
+    - "kelee.one"
 
   script:
     - match: ^https?:\/\/script\.hub\/($|edit\/|reload)
@@ -20,6 +27,11 @@ http:
       timeout: 300
 
     - match: ^https?:\/\/script\.hub\/file\/_start_\/.+type=(?:qx-rewrite|surge-module|shadowrocket-module|loon-plugin|all-module)
+      name: "Script Hub: 重写转换"
+      type: request
+      timeout: 300
+
+    - match: ^https?:\/\/(?:raw\.githubusercontent\.com|gist\.githubusercontent\.com|gitlab\.com|cdn\.jsdelivr\.net|fastly\.jsdelivr\.net|kelee\.one)\/[^?#]+\.(?:plugin|lpx|sgmodule)(?:[?#].*)?$
       name: "Script Hub: 重写转换"
       type: request
       timeout: 300
