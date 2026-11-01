@@ -51,7 +51,7 @@ script-providers:
     url: https://raw.githubusercontent.com/Script-Hub-Org/Script-Hub/main/script-hub.beta.js
     interval: 86400
   "Script Hub: 重写转换":
-    url: https://raw.githubusercontent.com/0daysseus/Script-Hub/main/Rewrite-Parser.beta.js
+    url: https://raw.githubusercontent.com/0daysseus/Script-Hub/refs/heads/feat/stash-override-arguments/Rewrite-Parser.beta.js
     interval: 86400
   "Script Hub: 规则集转换":
     url: https://raw.githubusercontent.com/Script-Hub-Org/Script-Hub/main/rule-parser.beta.js
