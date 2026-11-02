@@ -1560,6 +1560,27 @@ test('Stash installs a Loon or Surge module URL directly and passes other client
   }
 })
 
+test('Surge JSON arguments substitute the last key and line requirements stay conditional', async () => {
+  const source = [
+    '#!arguments=auto_hd:true,on_the_go:true',
+    '[Script]',
+    'response = type=http-response,pattern=^https:\\/\\/r\\.example\\.com,script-path=https://example.com/r.js,argument="{"autoHd":{{{auto_hd}}},"onTheGo":{{{on_the_go}}}}"',
+    `hd = type=http-request,pattern=^https:\\/\\/hd\\.example\\.com,script-path=https://example.com/hd.js,argument="{"autoHd":{{{auto_hd}}}}" #!REQUIREMENT "'{{{auto_hd}}}' == 'true'"`,
+  ].join('\n')
+  const stash = await convert(source, 'stash-stoverride', {}, 'surge-module')
+  const args = [...stash.body.matchAll(/argument: \|-\n\s+([^\n]+)/g)].map(match => match[1])
+  assert.deepEqual(args, ['{"autoHd":${args.auto_hd},"onTheGo":${args.on_the_go}}', '{"autoHd":${args.auto_hd}}'])
+  assert.match(stash.body, /^  on_the_go:\n    type: switch/m)
+  assert.match(stash.body, /\n    - match: \^https:\\\/\\\/hd/)
+  assert.match(JSON.stringify(stash.notifications), /#!REQUIREMENT.*已按参数默认值启用/)
+
+  const disabled = await convert(source.replace('auto_hd:true', 'auto_hd:false'), 'stash-stoverride', {}, 'surge-module')
+  assert.match(disabled.body, /#    - match: \^https:\\\/\\\/hd/)
+
+  const surge = await convert(source, 'surge-module', {}, 'surge-module')
+  assert.match(surge.body, /argument="\{"autoHd":\{\{\{auto_hd\}\}\}\}" #!REQUIREMENT "'\{\{\{auto_hd\}\}\}' == 'true'"/)
+})
+
 test('jq-path references load the jq file instead of becoming a literal filter', async () => {
   const jqUrl = 'https://example.com/filter.jq'
   const jqFile = '# header\n.a = "x # not a comment" # trailing\n| del(.ad)\n'

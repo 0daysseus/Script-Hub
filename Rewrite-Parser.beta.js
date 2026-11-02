@@ -411,6 +411,9 @@ if (binaryInfo != null && binaryInfo.length > 0) {
       .replace(/^#!PROFILE-VERSION-REQUIRED\s+[0-9]+\s+/i, '')
       .replace(/^(#)?host(-suffix|-keyword|-wildcard)?\s*,\s*/i, '$1DOMAIN$2,')
       .replace(/^(#)?ip6-cidr\s*,\s*/i, '$1IP-CIDR6,')
+    // Surge 行尾的 #!REQUIREMENT 是启用条件而不是注释，去掉行内注释前先取出
+    const lineRequirement = x.match(/\s+#!REQUIREMENT\s+(.+?)\s*$/i)?.[1] || ''
+    if (lineRequirement) x = x.replace(/\s+#!REQUIREMENT\s+.+$/i, '')
     if (!/^(#|\/\/|;)/.test(x)) {
       x = stripLoonV2InlineComment(x)
     }
@@ -1036,6 +1039,7 @@ if (binaryInfo != null && binaryInfo.length > 0) {
           engine,
           jsenable,
           namePrefix: !leadingTemplateIsNameOnly ? leadingTemplate?.key || '' : '',
+          requirement: lineRequirement,
           ori: x,
           num: y,
         })
@@ -1249,6 +1253,20 @@ if (binaryInfo != null && binaryInfo.length > 0) {
     targetCompatibilityWarnings.push(
       `Loon enable 动态布尔值无法由 ${app} 原生表达；已映射为模块行首占位符。相关参数：${keys}；留空启用，填 # 禁用。`
     )
+  }
+
+  // 只有 Surge 支持行级 #!REQUIREMENT；其他目标按参数默认值静态求值，条件不成立时注释该脚本
+  if (!isSurgeiOS) {
+    jsBox.forEach(item => {
+      if (!item.requirement) return
+      const result = evaluateSurgeRequirement(item.requirement)
+      if (result === false) item.noteK = '#'
+      targetCompatibilityWarnings.push(
+        `${item.ori} → ${app} 不支持 #!REQUIREMENT ${item.requirement}，${
+          result == null ? '无法静态求值，已保留脚本' : `已按参数默认值${result ? '启用' : '禁用'}`
+        }`
+      )
+    })
   }
 
   if (isLooniOS) {
@@ -1784,6 +1802,8 @@ if (binaryInfo != null && binaryInfo.length > 0) {
               jsarg = ', argument="' + jsarg + '"'
             if (jsarg != '' && (!/,/.test(jsarg) || /^".+"$/.test(jsarg) || isLoonArgumentContainer(jsarg)))
               jsarg = ', argument=' + jsarg
+            // 行级启用条件写在每种脚本行的末尾
+            if (isSurgeiOS && jsBox[i].requirement) jsarg += ' #!REQUIREMENT ' + jsBox[i].requirement
           }
 
           if (/generic/.test(jstype) && isShadowrocket) {
@@ -4650,6 +4670,61 @@ function resolveStashScriptEnable(item) {
   return enabled ? 'true' : 'false'
 }
 
+// 按参数默认值求值 Surge 行级条件，如 "'{{{auto_hd}}}' == 'true'"。
+// 含 CORE_VERSION、SYSTEM 等运行时变量时无法静态求值，返回 null。
+function evaluateSurgeRequirement(expression) {
+  const source = stripWrapQuote(expression).replace(/\{\{\{([^{}]+)\}\}\}/g, (_, key) => {
+    const arg = sgArg.find(item => item.key === key.trim())
+    return arg ? getArgumentDefaultValue(arg) : ''
+  })
+  const tokens = []
+  const matcher = /\s*(?:'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)"|(-?\d+(?:\.\d+)?)|(==|!=|>=|<=|&&|\|\||[><!()]))/y
+  let match
+  while (matcher.lastIndex < source.length && (match = matcher.exec(source))) {
+    if (match[4]) tokens.push({ op: match[4] })
+    else tokens.push({ value: match[3] != null ? Number(match[3]) : match[1] ?? match[2] })
+  }
+  if (source.slice(matcher.lastIndex).trim()) return null
+  let pos = 0
+  const peek = op => tokens[pos]?.op === op && ++pos
+  const primary = () => {
+    if (peek('(')) {
+      const value = or()
+      if (!peek(')')) throw new Error('missing )')
+      return value
+    }
+    if (peek('!')) return !primary()
+    const token = tokens[pos++]
+    if (!token || token.op) throw new Error('unexpected token')
+    return token.value
+  }
+  const comparison = () => {
+    const left = primary()
+    for (const op of ['==', '!=', '>=', '<=', '>', '<']) {
+      if (!peek(op)) continue
+      const right = primary()
+      return { '==': left == right, '!=': left != right, '>=': left >= right, '<=': left <= right, '>': left > right, '<': left < right }[op]
+    }
+    return left
+  }
+  const and = () => {
+    let value = comparison()
+    while (peek('&&')) value = comparison() && value
+    return value
+  }
+  const or = () => {
+    let value = and()
+    while (peek('||')) value = and() || value
+    return value
+  }
+  try {
+    const result = or()
+    return pos === tokens.length ? !!result : null
+  } catch (e) {
+    return null
+  }
+}
+
 // 一个段落内的条目全部被注释时，只剩 `script:` 这样的空键会被解析为 null 并覆盖配置中的同名字段。
 // 自下而上处理，使 `http:` 这类只含空子段的父键也一并注释。
 function commentEmptyStashKeys(body) {
@@ -4745,7 +4820,8 @@ function applyStashArguments(body) {
   const usedNames = new Set()
   for (const item of sgArg) {
     const key = escapeRegExp(item.key)
-    const token = () => new RegExp(`(?<!\\{)\\$?\\{${key}\\}(?!\\})`, 'g')
+    // JSON 参数中引用常紧挨对象的括号，如 {"a":{key}}，不能用前后括号判断是否为引用
+    const token = () => new RegExp(`\\$?\\{${key}\\}`, 'g')
     if (!token().test(body)) continue
     const defaultValue = getArgumentDefaultValue(item)
     // MitM/force-http-engine 列表项在运行时不能拆分，逗号分隔的主机名参数按默认值展开
