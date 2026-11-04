@@ -57,6 +57,7 @@ let url
   const evUrlmodi = queryObject.evalUrlmodi ?? ''
   const wrap_response = queryObject.wrap_response
   const compatibilityOnly = istrue(queryObject.compatibilityOnly)
+  const stashDoneFix = istrue(queryObject.stashDoneFix)
   const isScriptConversion = type.endsWith('-script')
 
   const subconverter = queryObject.subconverter
@@ -380,6 +381,21 @@ try {
     throw e
   }
   }`
+  }
+
+  // Surge 脚本无参调用 $done() 表示不修改；Stash 的响应脚本这样放行后 App 会反复重试（如 YouTube 评论加载不出来），
+  // 带回原始 body 则正常。原脚本放进以 $done 为参数的函数里，不改动原脚本内容
+  if (stashDoneFix && isScriptConversion && typeof body === 'string') {
+    body = `// Script Hub: Stash 兼容，无参 $done() 改为带回原始 body
+;(async function ($done) {
+${body}
+})(function (value) {
+  if (value == null) value = typeof $response !== 'undefined' && $response ? { body: $response.body } : {}
+  return $done(value)
+}).catch(function (e) {
+  console.log('❌ Script Hub: 原脚本出错 ' + e)
+})
+`
   }
 
   if (prepend && isScriptConversion) {

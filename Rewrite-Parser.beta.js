@@ -71,6 +71,9 @@ else if (/^关闭(?:通知)?$/.test(localsetNtf)) noNtf = true
 let jqEnabled = istrue(queryObject.jqEnabled)
 // Stash 3.7+ 覆写参数；stashArgs=false 时按默认值写死，兼容旧版 Stash
 let stashArgsEnabled = queryObject.stashArgs == undefined ? true : istrue(queryObject.stashArgs)
+// Surge 脚本无参调用 $done() 表示不修改，Stash 的响应脚本这样放行后 App 会反复重试（如 YouTube 评论加载不出来）。
+// 覆写里的响应脚本经脚本转换下载，由 script-converter 包一层改为带回原始 body；stashDoneFix=false 时关闭
+let stashDoneFixEnabled = queryObject.stashDoneFix == undefined ? true : istrue(queryObject.stashDoneFix)
 let openMsgHtml = istrue(queryObject.openMsgHtml)
 
 noNtf = openMsgHtml ? true : noNtf
@@ -2042,7 +2045,8 @@ if (binaryInfo != null && binaryInfo.length > 0) {
             jsarg
         )
         if (!stashDisabled) {
-          providers.push(`${noteK2}"` + jsname + '":' + `${noteKn4}url: ` + jsurl + `${noteKn4}interval: 86400`)
+          const providerUrl = jstype == 'response' && stashDoneFixEnabled ? toStashDoneFixUrl(jsurl) : jsurl
+          providers.push(`${noteK2}"` + jsname + '":' + `${noteKn4}url: ` + providerUrl + `${noteKn4}interval: 86400`)
         }
       }
       if (jstype == 'cron') {
@@ -5424,6 +5428,13 @@ function toJsc(jsurl, jscStatus, jsc2Status, jsfrom) {
   } else {
     return jsurl
   }
+}
+
+// 只改写覆写中引用的响应脚本地址；已经过脚本转换（jsc/jsc2）的地址只追加参数
+function toStashDoneFixUrl(jsurl) {
+  if (/^https?:\/\/script\.hub\/convert\//i.test(jsurl)) return `${jsurl}&stashDoneFix=true`
+  const fileName = jsurl.split(/[?#]/)[0].split('/').pop() || 'script.js'
+  return `http://script.hub/convert/_start_/${jsurl}/_end_/${fileName}?type=stash-script&target=stash-script&stashDoneFix=true`
 }
 
 function shNotify(box) {

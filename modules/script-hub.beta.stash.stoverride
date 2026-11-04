@@ -57,5 +57,5 @@ script-providers:
     url: https://raw.githubusercontent.com/Script-Hub-Org/Script-Hub/main/rule-parser.beta.js
     interval: 86400
   "Script Hub: 脚本转换":
-    url: https://raw.githubusercontent.com/Script-Hub-Org/Script-Hub/main/script-converter.beta.js
+    url: https://raw.githubusercontent.com/0daysseus/Script-Hub/refs/heads/feat/stash-override-arguments/script-converter.beta.js
     interval: 86400

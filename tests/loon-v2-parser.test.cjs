@@ -1608,3 +1608,27 @@ test('jq-path references load the jq file instead of becoming a literal filter',
   assert.match(loon.body, /bare\\\.example\\\.com\/i? then response\.json\.jq_file\("https:\/\/example\.com\/filter\.jq"\)/)
   assert.doesNotMatch(loon.body, /(?:quoted|bare)\\\.example\\\.com\/i? then response\.json\.jq\(/)
 })
+
+test('Stash conversion downloads only the override response scripts through the done fix', async () => {
+  const source = `#!name=Done fix
+[Script]
+yt.response = type=http-response,pattern=^https:\\/\\/example\\.com\\/next,requires-body=1,binary-body-mode=1,script-path=https://raw.githubusercontent.com/a/b/main/response.js
+yt.request = type=http-request,pattern=^https:\\/\\/example\\.com\\/log,script-path=https://raw.githubusercontent.com/a/b/main/request.js
+
+[MITM]
+hostname = %APPEND% example.com
+`
+  const fixed = await convert(source, 'stash-stoverride', {}, 'surge-module')
+  assert.match(
+    fixed.body,
+    /url: http:\/\/script\.hub\/convert\/_start_\/https:\/\/raw\.githubusercontent\.com\/a\/b\/main\/response\.js\/_end_\/response\.js\?type=stash-script&target=stash-script&stashDoneFix=true$/m
+  )
+  assert.match(fixed.body, /url: https:\/\/raw\.githubusercontent\.com\/a\/b\/main\/request\.js$/m)
+
+  const disabled = await convert(source, 'stash-stoverride', {}, 'surge-module', { stashDoneFix: 'false' })
+  assert.doesNotMatch(disabled.body, /stashDoneFix/)
+  assert.match(disabled.body, /url: https:\/\/raw\.githubusercontent\.com\/a\/b\/main\/response\.js$/m)
+
+  const surge = await convert(source, 'surge-module', {}, 'surge-module')
+  assert.doesNotMatch(surge.body, /stashDoneFix/)
+})
